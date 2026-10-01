@@ -1,0 +1,44 @@
+{
+    "search_url": "https://www.naukri.com/java-developer-jobs-in-pune",
+    "max_applications_per_run": 5,
+    "candidate": {
+        "name": "Tanvir Jahagirdar",
+        "total_exp_years": 3,
+        "primary_skills": [
+            "Java",
+            "Spring Boot",
+            "Spring Framework",
+            "REST APIs",
+            "Microservices",
+            "PostgreSQL",
+            "React.js",
+            "Next.js",
+            "AWS"
+        ],
+        "secondary_skills": [
+            "Kotlin",
+            "JavaScript",
+            "TypeScript",
+            "Node.js",
+            "SQL",
+            "MongoDB",
+            "MySQL",
+            "Spring Security",
+            "Docker",
+            "AWS ECS",
+            "CI/CD",
+            "Tailwind CSS",
+            "Redux"
+        ],
+        "current_ctc_lpa": "12",
+        "expected_ctc_lpa": "18",
+        "notice_period_days": "30",
+        "current_location": "Nashik",
+        "preferred_locations": [
+            "Pune",
+            "Mumbai",
+            "Remote",
+            "Bangalore"
+        ]
+    }
+}

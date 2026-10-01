@@ -1,0 +1,26 @@
+{
+  "name": "Tanvir Jahagirdar",
+  "headline": "Java Full Stack Developer",
+  "summary": "Java Full Stack Developer with 3+ years experience designing and delivering scalable REST APIs, microservices, and cloud-ready web applications using Java, Spring Boot, PostgreSQL, React.js, Next.js, and AWS. Experienced with OSLC integrations, asynchronous processing, retry mechanisms, and optimistic locking.",
+  "skills": [
+    "Java",
+    "Kotlin",
+    "JavaScript",
+    "TypeScript",
+    "Spring Boot",
+    "React.js",
+    "Next.js",
+    "PostgreSQL",
+    "MongoDB",
+    "AWS",
+    "Docker",
+    "CI/CD",
+    "Spring Security",
+    "Auth0",
+    "OAuth2",
+    "JWT",
+    "Microservices",
+    "OSLC",
+    "REST"
+  ]
+}
