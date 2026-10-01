@@ -30,5 +30,5 @@ def run_pipeline(candidate_path: str, jobs_path: str, top_n: int = 5):
 
 
 if __name__ == "__main__":
-    result = run_pipeline("data/tanvir_resume.json", top_n=3)
+    result = run_pipeline("data/sample_resume.json", top_n=3)
     print(json.dumps(result, indent=2))
