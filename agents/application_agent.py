@@ -1,10 +1,20 @@
+import warnings
 from typing import Dict, List
 from playwright.async_api import Page, BrowserContext
 
+
 class ApplicationAgent:
-    """Use Playwright to open the job and perform the application workflow. Fill only verified information."""
+    """Deprecated scaffold.
+
+    Browser actions are handled in the active live flow in main.py.
+    """
 
     def __init__(self, context: BrowserContext, candidate: Dict):
+        warnings.warn(
+            "ApplicationAgent is deprecated; use the live browser flow in main.py instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.context = context
         self.candidate = candidate
 

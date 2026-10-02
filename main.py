@@ -15,6 +15,7 @@ load_dotenv(".env.local")
 from agents.matching_agent import MatchingAgent
 from agents.reasoning_agent import ReasoningAgent
 from agents.questionnaire_agent import QuestionnaireAgent
+from agents.orchestrator import Orchestrator
 
 
 SKILL_HINTS = [
@@ -33,6 +34,20 @@ with open("config.json", "r") as f:
 # Initialize Gemini Client
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
+
+
+def _time_action(label: str):
+    """Simple async timer wrapper for critical steps in the browser flow."""
+    start = time.perf_counter()
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
+            result = await func(*args, **kwargs)
+            elapsed = time.perf_counter() - start
+            print(f"[TIMING] {label}: {elapsed:.2f}s")
+            return result
+        return wrapper
+    return decorator
+
 
 def _fallback_decision(match_context: dict | None, jd_text: str, questions: list) -> dict:
     """Local fallback when Gemini is unavailable or disconnects."""
@@ -151,19 +166,23 @@ def extract_skill_tokens(text: str) -> list:
     return found
 
 
-def build_match_context(candidate: dict, jobs: list, top_n: int = 5) -> dict:
-    """Generate the compact JSON context for Gemini from the local ranking and reasoning agents."""
+def build_match_context(candidate: dict, jobs: list, top_n: int = 5, matcher: MatchingAgent | None = None, reasoner: ReasoningAgent | None = None) -> dict:
+    """Generate the compact JSON context for Gemini from the local ranking and reasoning agents.
+
+    Reuses already-created agent instances when available so repeated job evaluations do not
+    reinitialize the same local models for every candidate/job pair.
+    """
     if not jobs:
         return {"local_matcher": {"status": "skipped", "reason": "No job bank loaded"}}
 
-    matcher = MatchingAgent(model_name="BAAI/bge-small-en-v1.5")
+    matcher = matcher or MatchingAgent(model_name="BAAI/bge-small-en-v1.5")
     ranked_jobs = matcher.rank_jobs(candidate, jobs, top_n=top_n)
     if not ranked_jobs:
         return {"local_matcher": {"status": "skipped", "reason": "No jobs available for ranking"}}
 
     top_jobs = [{"rank": item["rank"], "score": item["score"], "job": item["job"]} for item in ranked_jobs]
     fit_score = int(round(sum(item["score"] for item in ranked_jobs) / len(ranked_jobs) * 100))
-    reasoner = ReasoningAgent(model_name="qwen2.5:0.5b-instruct")
+    reasoner = reasoner or ReasoningAgent(model_name="qwen2.5:0.5b-instruct")
     reasoning = reasoner.decide_apply(candidate, top_jobs, fit_score)
 
     return {
@@ -349,14 +368,15 @@ async def _answer_in_chatbot_drawer(drawer, answer: str, question: str = "", rea
     """Fill the current input control inside the Naukri chatbot drawer and return True if filled.
 
     Handles three Naukri chatbot question types:
-      1. Radio buttons (Yes/No or multiple choice)
+      1. Radio buttons / checkbox choices (Yes/No or multiple choice)
       2. Text/number input field ("Type message here...")
       3. Select dropdown
     """
+    checkbox_normalized = QuestionnaireAgent.normalize_field_answer("checkbox", answer)
     normalized = QuestionnaireAgent.normalize_field_answer("radio", answer)
     filled = False
 
-    # NEW: Prefer explicit input/select/textarea controls inside the drawer and handle by control type.
+    # Prefer explicit input/select/textarea controls inside the drawer and handle by control type.
     try:
         inputs = await drawer.query_selector_all("input")
         print(f"    --> Found {len(inputs)} input elements in drawer")
@@ -365,7 +385,6 @@ async def _answer_in_chatbot_drawer(drawer, answer: str, question: str = "", rea
 
     # Process input elements first (by type)
     if inputs:
-        # Group radios by name so we can choose the best match collectively
         radios_by_name = {}
         for inp in inputs:
             try:
@@ -381,7 +400,7 @@ async def _answer_in_chatbot_drawer(drawer, answer: str, question: str = "", rea
 
                 if itype == "checkbox":
                     try:
-                        desired = normalized in {"yes", "true", "1"} or answer.strip().lower() in {"yes", "true", "1"}
+                        desired = checkbox_normalized in {"yes", "true", "1"} or answer.strip().lower() in {"yes", "true", "1"}
                         try:
                             is_checked = await inp.is_checked()
                         except Exception:
@@ -393,7 +412,6 @@ async def _answer_in_chatbot_drawer(drawer, answer: str, question: str = "", rea
                     except Exception:
                         continue
 
-                # Text-like inputs
                 if itype in {"text", "search", "email", "number", "tel", "password", "date"} or itype == "":
                     try:
                         await inp.click()
@@ -406,96 +424,137 @@ async def _answer_in_chatbot_drawer(drawer, answer: str, question: str = "", rea
             except Exception:
                 continue
 
-        # Handle radio groups: for each group, pick the radio whose label matches the normalized answer
-        print(f"    --> radios_by_name groups: {list(radios_by_name.keys())}")
-        for name, radios in radios_by_name.items():
-            try:
-                print(f"    --> Processing radio group '{name}' with {len(radios)} options")
-                print(f"    --> Answer: '{answer}', Normalized: '{normalized}'")
-                
-                # Collect all radio labels/values for matching
-                radio_options = []
+    # Explicit checkbox/role=checkbox fallback for ATS forms that render checkbox semantics without native inputs.
+    checkbox_selectors = [
+        "input[type='checkbox']",
+        "[role='checkbox']",
+        "[aria-label*='yes']",
+        "[aria-label*='no']",
+        "[data-testid*='checkbox']",
+    ]
+    for sel in checkbox_selectors:
+        try:
+            boxes = await drawer.query_selector_all(sel)
+            for box in boxes:
+                try:
+                    if not await box.is_visible():
+                        continue
+                    label_text = ""
+                    try:
+                        ancestor = await box.evaluate_handle("el => el.closest('label') || el.parentElement || el.closest('[role=\'option\']')")
+                        if ancestor:
+                            label_text = (await ancestor.inner_text() or "").strip().lower()
+                    except Exception:
+                        pass
+                    value_text = ((await box.get_attribute("value") or "") + " " + (await box.get_attribute("aria-label") or "") + " " + (await box.get_attribute("title") or "")).strip().lower()
+                    text_blob = (label_text + " " + value_text).strip().lower()
+                    target_yes = checkbox_normalized in {"yes", "true", "1"} or answer.strip().lower() in {"yes", "true", "1"}
+                    if (target_yes and ("yes" in text_blob or "agree" in text_blob or "available" in text_blob)) or ((not target_yes) and ("no" in text_blob or "decline" in text_blob or "not available" in text_blob)):
+                        try:
+                            await box.click()
+                            print(f"    --> Selected checkbox/role=checkbox with match '{text_blob}' for answer '{answer}'")
+                            return True
+                        except Exception:
+                            try:
+                                await box.evaluate("el => el.click()")
+                                print(f"    --> Selected checkbox via JS with match '{text_blob}' for answer '{answer}'")
+                                return True
+                            except Exception:
+                                continue
+                except Exception:
+                    continue
+        except Exception:
+            continue
+
+    # Handle radio groups: for each group, pick the radio whose label matches the normalized answer
+    print(f"    --> radios_by_name groups: {list(radios_by_name.keys())}")
+    for name, radios in radios_by_name.items():
+        try:
+            print(f"    --> Processing radio group '{name}' with {len(radios)} options")
+            print(f"    --> Answer: '{answer}', Normalized: '{normalized}'")
+            
+            # Collect all radio labels/values for matching
+            radio_options = []
+            for r in radios:
+                try:
+                    label_text = ""
+                    try:
+                        parent = await r.evaluate_handle("el => el.closest('label')")
+                        if parent:
+                            label_text = (await parent.inner_text() or "").strip()
+                    except Exception:
+                        pass
+                    
+                    if not label_text:
+                        try:
+                            label_text = await r.evaluate("""el => {
+                                let label = el.nextElementSibling;
+                                while (label && label.tagName !== 'LABEL') label = label.nextElementSibling;
+                                return label ? label.innerText : '';
+                            }""") or ""
+                            label_text = label_text.strip()
+                        except Exception:
+                            pass
+                    
+                    if not label_text:
+                        try:
+                            label_text = await r.evaluate("el => el.parentElement ? el.parentElement.innerText : ''") or ""
+                            label_text = label_text.strip()
+                        except Exception:
+                            pass
+                    
+                    value = (await r.get_attribute("value") or "").strip()
+                    display_text = label_text if label_text else value
+                    if display_text:
+                        radio_options.append(display_text)
+                        print(f"      --> Radio option: '{display_text}'")
+                except Exception:
+                    continue
+            
+            # Use ReasoningAgent to match answer to options if available
+            matched_option = None
+            if reasoner and question and radio_options:
+                print(f"    --> Using ReasoningAgent to match '{answer}' to options: {radio_options}")
+                matched_option = reasoner.match_answer_to_options(CONFIG["candidate"], question, answer, radio_options)
+                print(f"    --> ReasoningAgent matched: '{matched_option}'")
+            
+            # Fallback to local matching if no reasoner match
+            if not matched_option:
+                matched_option = _match_answer_to_radio_options(answer, normalized, radio_options)
+                print(f"    --> Local fallback matched: '{matched_option}'")
+            
+            # Click the matched radio
+            if matched_option:
                 for r in radios:
                     try:
                         label_text = ""
                         try:
                             parent = await r.evaluate_handle("el => el.closest('label')")
                             if parent:
-                                label_text = (await parent.inner_text() or "").strip()
+                                label_text = (await parent.inner_text() or "").strip().lower()
                         except Exception:
                             pass
+                        value = (await r.get_attribute("value") or "").strip().lower()
                         
-                        if not label_text:
+                        if matched_option.lower() in label_text or matched_option.lower() in value or label_text in matched_option.lower() or value in matched_option.lower():
+                            print(f"      --> Attempting click on radio with label='{label_text}' value='{value}' for matched option '{matched_option}'")
                             try:
-                                label_text = await r.evaluate("""el => {
-                                    let label = el.nextElementSibling;
-                                    while (label && label.tagName !== 'LABEL') label = label.nextElementSibling;
-                                    return label ? label.innerText : '';
-                                }""") or ""
-                                label_text = label_text.strip()
-                            except Exception:
-                                pass
-                        
-                        if not label_text:
-                            try:
-                                label_text = await r.evaluate("el => el.parentElement ? el.parentElement.innerText : ''") or ""
-                                label_text = label_text.strip()
-                            except Exception:
-                                pass
-                        
-                        value = (await r.get_attribute("value") or "").strip()
-                        display_text = label_text if label_text else value
-                        if display_text:
-                            radio_options.append(display_text)
-                            print(f"      --> Radio option: '{display_text}'")
+                                await r.click()
+                                print(f"    --> Selected radio in group '{name}' with label '{label_text}' value='{value}' for answer '{answer}'")
+                                return True
+                            except Exception as click_e:
+                                print(f"      --> Click failed: {click_e}, trying JS click")
+                                try:
+                                    await r.evaluate("el => el.click()")
+                                    print(f"    --> Selected radio via JS in group '{name}' with label '{label_text}' value='{value}' for answer '{answer}'")
+                                    return True
+                                except Exception as js_e:
+                                    print(f"      --> JS click also failed: {js_e}")
+                                    continue
                     except Exception:
                         continue
-                
-                # Use ReasoningAgent to match answer to options if available
-                matched_option = None
-                if reasoner and question and radio_options:
-                    print(f"    --> Using ReasoningAgent to match '{answer}' to options: {radio_options}")
-                    matched_option = reasoner.match_answer_to_options(CONFIG["candidate"], question, answer, radio_options)
-                    print(f"    --> ReasoningAgent matched: '{matched_option}'")
-                
-                # Fallback to local matching if no reasoner match
-                if not matched_option:
-                    matched_option = _match_answer_to_radio_options(answer, normalized, radio_options)
-                    print(f"    --> Local fallback matched: '{matched_option}'")
-                
-                # Click the matched radio
-                if matched_option:
-                    for r in radios:
-                        try:
-                            # Check if this radio matches our selected option
-                            label_text = ""
-                            try:
-                                parent = await r.evaluate_handle("el => el.closest('label')")
-                                if parent:
-                                    label_text = (await parent.inner_text() or "").strip().lower()
-                            except Exception:
-                                pass
-                            value = (await r.get_attribute("value") or "").strip().lower()
-                            
-                            if matched_option.lower() in label_text or matched_option.lower() in value or label_text in matched_option.lower() or value in matched_option.lower():
-                                print(f"      --> Attempting click on radio with label='{label_text}' value='{value}' for matched option '{matched_option}'")
-                                try:
-                                    await r.click()
-                                    print(f"    --> Selected radio in group '{name}' with label '{label_text}' value='{value}' for answer '{answer}'")
-                                    return True
-                                except Exception as click_e:
-                                    print(f"      --> Click failed: {click_e}, trying JS click")
-                                    try:
-                                        await r.evaluate("el => el.click()")
-                                        print(f"    --> Selected radio via JS in group '{name}' with label '{label_text}' value='{value}' for answer '{answer}'")
-                                        return True
-                                    except Exception as js_e:
-                                        print(f"      --> JS click also failed: {js_e}")
-                                        continue
-                        except Exception:
-                            continue
-            except Exception:
-                continue
+        except Exception:
+            continue
 
     # Next prefer selects and textareas inside drawer
     try:
@@ -744,8 +803,8 @@ async def _click_save_in_drawer(drawer, page) -> bool:
     print(f"    --> Searching for Save button with {len(save_selectors)} selectors...")
     
     # Try all selectors in parallel-ish manner with shorter wait
-    wait_ms = 2000  # Reduced from 5000ms
-    poll = 200
+    wait_ms = 800
+    poll = 100
     
     async def try_click_button(btn, context_name: str) -> bool:
         """Try to click a button with minimal wait for enable."""
@@ -934,7 +993,7 @@ async def _handle_standard_form(page, answers: list) -> bool:
                 if btn and await btn.is_visible():
                     await btn.click()
                     print("    --> Clicked Submit on form.")
-                    await page.wait_for_timeout(1500)  # Reduced from 3000ms
+                    await page.wait_for_timeout(500)
                     break
             except Exception:
                 pass
@@ -1040,7 +1099,7 @@ async def process_screening_modal(page, answers: list) -> bool:
 
     for _round in range(max_questions):
         # Wait for the next question to render - reduced from 1500ms
-        await page.wait_for_timeout(800)
+        await page.wait_for_timeout(300)
 
         # Check for success/completion
         try:
@@ -1134,7 +1193,7 @@ async def process_screening_modal(page, answers: list) -> bool:
         # If still not filled, attempt 2 quick retries (some drawers need a small delay)
         if not filled:
             for retry in range(2):
-                await page.wait_for_timeout(700)
+                await page.wait_for_timeout(250)
                 filled = await _answer_in_chatbot_drawer(drawer, answer, question, reasoner)
                 if filled:
                     break
@@ -1201,7 +1260,7 @@ async def process_screening_modal(page, answers: list) -> bool:
                 return False
         else:
             # Verify that the Save advanced the drawer (new question) or led to success
-            await page.wait_for_timeout(600)  # Reduced from 1200ms
+            await page.wait_for_timeout(200)
             try:
                 still_vis = await drawer.is_visible()
             except Exception:
@@ -1405,11 +1464,13 @@ async def run():
             args=["--start-maximized"]
         )
         
+        orchestrator = Orchestrator(CONFIG, context=context)
+
         # Tab 1: Primary Search Page
         search_page = context.pages[0] if context.pages else await context.new_page()
         print("Navigating to Naukri homepage...")
         await search_page.goto("https://www.naukri.com/", wait_until="domcontentloaded")
-        await search_page.wait_for_timeout(2000)  # Reduced from 3000ms
+        await search_page.wait_for_timeout(1200)
 
         print("Navigating to Recommended section...")
         try:
@@ -1421,11 +1482,11 @@ async def run():
             else:
                 print("Navigating directly to recommended URL fallback.")
                 await search_page.goto("https://www.naukri.com/mnj/recommendedjobs", wait_until="domcontentloaded")
-            await search_page.wait_for_timeout(3000)  # Reduced from 5000ms
+            await search_page.wait_for_timeout(1200)
         except Exception as e:
             print(f"Error clicking recommended section, falling back to direct URL: {e}")
             await search_page.goto("https://www.naukri.com/mnj/recommendedjobs", wait_until="domcontentloaded")
-            await search_page.wait_for_timeout(3000)  # Reduced from 5000ms
+            await search_page.wait_for_timeout(1200)
 
         # Tab 2: Dedicated Single Tab for processing individual job links
         job_page = await context.new_page()
@@ -1452,7 +1513,7 @@ async def run():
                     await title_elem.click()
                 current_job_page = await new_page_info.value
                 await current_job_page.wait_for_load_state("domcontentloaded")
-                await current_job_page.wait_for_timeout(2000)
+                await current_job_page.wait_for_timeout(600)
                 
                 # Wait for JD element to load
                 try:
@@ -1492,9 +1553,22 @@ async def run():
                 print(f"    -> Job scraped: Title='{job_payload['title']}' | Company='{job_payload.get('company','')}'")
                 scraped_jobs.append(job_payload)
 
-                # Rank this actual scraped job list before sending to Gemini.
-                match_context = build_match_context(CONFIG["candidate"], scraped_jobs, top_n=min(5, len(scraped_jobs)))
+                # Rank this actual scraped job list before sending to Gemini using the active orchestrator.
+                start_match = time.perf_counter()
+                match_context = build_match_context(
+                    CONFIG["candidate"],
+                    scraped_jobs,
+                    top_n=min(5, len(scraped_jobs)),
+                    matcher=orchestrator.matcher,
+                    reasoner=orchestrator.reasoner,
+                )
+                match_elapsed = time.perf_counter() - start_match
+                print(f"[TIMING] Job matching: {match_elapsed:.2f}s")
+
+                start_eval = time.perf_counter()
                 evaluation = evaluate_jd_and_questions_gemini(jd_text, questions, match_context=match_context)
+                eval_elapsed = time.perf_counter() - start_eval
+                print(f"[TIMING] JD + question evaluation: {eval_elapsed:.2f}s")
                 print(f"Match Score: {evaluation.get('match_score', 0)}% | Reason: {evaluation.get('reason')} | Job: '{job_payload['title']}' @ '{job_payload.get('company','')}'")
                 if match_context.get("local_matcher", {}).get("status") == "ok":
                     print(f"Local matching context: {json.dumps(match_context, indent=2)}")
@@ -1517,10 +1591,14 @@ async def run():
                         else:
                             await apply_btn.click()
                             print("--> Clicked 'Apply'.")
-                            await current_job_page.wait_for_timeout(1000)  # Reduced from 2000ms
+                            await current_job_page.wait_for_timeout(500)
 
-                            # Ensure we have per-question answers; fall back to local reasoner if missing
-                            answers = evaluation.get("answers") or ReasoningAgent().build_answers_for_questions(CONFIG["candidate"], questions)
+                            # Ensure we have per-question answers; reuse the orchestrator's active reasoning path.
+                            start_q = time.perf_counter()
+                            answers = evaluation.get("answers") or orchestrator.answer_questions(questions)
+                            q_elapsed = time.perf_counter() - start_q
+                            print(f"[TIMING] Questionnaire answer generation: {q_elapsed:.2f}s")
+
                             submitted = await _handle_apply_flow(context, current_job_page, answers)
                             if submitted:
                                 applied_count += 1
@@ -1594,7 +1672,7 @@ async def run():
                         await current_job_page.close()
                     except Exception:
                         pass
-                await asyncio.sleep(20.0)  # Updated delay to respect free tier quota (approx 3 requests/min)
+                await asyncio.sleep(3.0)
             except Exception as e:
                 print(f"Error evaluating job #{idx + 1}: {e}")
                 if 'current_job_page' in locals() and not current_job_page.is_closed():

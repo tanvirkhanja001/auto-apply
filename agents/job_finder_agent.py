@@ -1,14 +1,21 @@
 import asyncio
+import warnings
 from typing import List, Dict
 from playwright.async_api import Page
 
-class JobFinderAgent:
-    """Search Naukri using configured roles, skills, experience and locations.
 
-    Extract job title, company, JD, location and URL.
+class JobFinderAgent:
+    """Deprecated scaffold.
+
+    Use MatchingAgent + ReasoningAgent + QuestionnaireAgent in the active flow.
     """
 
     def __init__(self, search_config: Dict):
+        warnings.warn(
+            "JobFinderAgent is deprecated; use the active matching/reasoning pipeline instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.search_config = search_config
 
     async def search(self, page: Page, max_results: int = 50) -> List[Dict]:

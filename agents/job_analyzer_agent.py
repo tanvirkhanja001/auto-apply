@@ -1,10 +1,20 @@
 import json
+import warnings
 from typing import Dict, List
 
+
 class JobAnalyzerAgent:
-    """Compare JD with resume/profile, identify matched/missing skills, and return relevance and APPLY/SKIP."""
+    """Deprecated scaffold.
+
+    The active rank/decision flow is handled by MatchingAgent + ReasoningAgent.
+    """
 
     def __init__(self, model_name: str = "SmolLM2-360M-Instruct"):
+        warnings.warn(
+            "JobAnalyzerAgent is deprecated; use MatchingAgent and ReasoningAgent instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.model_name = model_name
 
     def analyze(self, resume: Dict, job: Dict) -> Dict:

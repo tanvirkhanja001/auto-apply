@@ -1,6 +1,13 @@
 {
     "search_url": "https://www.naukri.com/java-developer-jobs-in-pune",
-    "max_applications_per_run": 5,
+    "max_applications_per_run": 1,
+    "reasoning": {
+        "model_priority": [
+            "gemini-3.5-flash",
+            "qwen2.5:0.5b-instruct",
+            "SmolLM2-360M-Instruct"
+        ]
+    },
     "candidate": {
         "name": "Tanvir Jahagirdar",
         "total_exp_years": 3,

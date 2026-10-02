@@ -1,9 +1,19 @@
+import warnings
 from typing import Dict
 
+
 class ResumeAgent:
-    """Select/adapt the resume for the JD. Only use truthful info from resume input."""
+    """Deprecated scaffold.
+
+    The active flow does not require a separate resume-tailoring agent.
+    """
 
     def __init__(self, profile: Dict):
+        warnings.warn(
+            "ResumeAgent is deprecated; use the active reasoning and matching pipeline instead.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         self.profile = profile
 
     def prepare_for_job(self, job: Dict) -> Dict:
